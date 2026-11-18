@@ -4,9 +4,11 @@ Pages
 -----
 ``/``                          catalogue browser, watermark, run controls
 ``/runs``                      round history (windows, attempts, restarts, errors)
+``/samples``                   change-sampling inspector for successful rounds
 ``/status``                    statically rendered status JSON
 ``GET  /api/status``           polling endpoint used by the page
 ``GET  /api/catalog``          catalogue JSON (search + pagination)
+``GET  /api/samples``          deterministic change-sample JSON for one round
 ``POST /api/harvest``          start a round
 ``POST /api/harvest/cancel``   cancel the active round without waiting for it
 ``POST /api/harvest/restart``  cancel (if any) and immediately start a new round
@@ -25,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .harvest import HarvestConfig, Harvester
+from .sampling import CHANGE_LABELS, SamplingError, select_sample, validate_params
 from .store import Store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -184,6 +187,107 @@ def create_app(
     @app.get("/api/catalog")
     async def api_catalog(q: str = "", page: int = 1, page_size: int = 20) -> JSONResponse:
         return JSONResponse(store.catalog_page(q, page, page_size))
+
+    def _sample_payload(
+        run_id: str | None, sample_size: int, seed: int
+    ) -> dict[str, Any]:
+        try:
+            validate_params(sample_size, seed)
+        except SamplingError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        if not run_id:
+            raise HTTPException(status_code=404, detail="请选择一个成功采集轮次")
+        run = store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="轮次不存在")
+        if run["status"] != "succeeded":
+            raise HTTPException(
+                status_code=409, detail="只有成功采集的轮次才能抽样"
+            )
+        changes = store.run_changes(run_id)
+        if changes is None:  # defensive: get_run already established success
+            raise HTTPException(
+                status_code=409, detail="只有成功采集的轮次才能抽样"
+            )
+
+        # Legacy successful rounds predate change evidence: they are
+        # unsampleable, never reported as "zero changes".
+        sampleable = bool(run.get("changes_tracked"))
+        type_counts = {change_type: 0 for change_type in CHANGE_LABELS}
+        for change in changes:
+            type_counts[change["change_type"]] += 1
+
+        payload: dict[str, Any] = {
+            "run": {
+                "id": run["id"],
+                "started_at": run["started_at"],
+                "finished_at": run["finished_at"],
+                "window_from": run["window_from"],
+                "window_until": run["window_until"],
+                "watermark_after": run["watermark_after"],
+                "changes_tracked": sampleable,
+            },
+            "params": {"sample_size": sample_size, "seed": seed},
+            "sampleable": sampleable,
+            "change_counts": type_counts,
+            "total_changes": len(changes),
+            "samples": [],
+        }
+        if sampleable:
+            payload["samples"] = select_sample(
+                changes, run_id=run_id, sample_size=sample_size, seed=seed
+            )
+        return payload
+
+    @app.get("/api/samples")
+    async def api_samples(
+        run_id: str | None = None, sample_size: int = 5, seed: int = 0
+    ) -> JSONResponse:
+        return JSONResponse(_sample_payload(run_id, sample_size, seed))
+
+    @app.get("/samples", response_class=HTMLResponse)
+    async def samples_page(
+        request: Request,
+        run_id: str | None = None,
+        sample_size: str = "5",
+        seed: str = "0",
+    ) -> HTMLResponse:
+        successful = store.list_successful_runs()
+        selected_id = run_id or (successful[0]["id"] if successful else None)
+
+        # Parse the form values by hand so a typo renders an in-page message
+        # instead of FastAPI's raw 422 page.
+        error: str | None = None
+        parsed_size = 5
+        parsed_seed = 0
+        try:
+            parsed_size = int(str(sample_size).strip())
+            parsed_seed = int(str(seed).strip())
+        except (TypeError, ValueError):
+            error = "样本数与种子都必须是整数（样本数 1～20）。"
+
+        result: dict[str, Any] | None = None
+        if error is None and selected_id:
+            try:
+                result = _sample_payload(selected_id, parsed_size, parsed_seed)
+            except HTTPException as exc:
+                error = str(exc.detail)
+
+        return templates.TemplateResponse(
+            request,
+            "samples.html",
+            {
+                "runs": successful,
+                "selected_id": selected_id,
+                "sample_size": parsed_size if error is None else sample_size,
+                "seed": parsed_seed if error is None else seed,
+                "result": result,
+                "error": error,
+                "change_labels": CHANGE_LABELS,
+                "published": store.published_state(),
+            },
+        )
 
     return app
 

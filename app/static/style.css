@@ -99,6 +99,23 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .badge.succeeded { background: #e3f5ea; color: var(--ok); }
 .badge.failed { background: #fdecea; color: var(--danger); }
 .badge.cancelled { background: #fdf3e3; color: var(--warn); }
+.badge.change-added { background: #e3f5ea; color: var(--ok); }
+.badge.change-corrected { background: #e4efff; color: #1d56b5; }
+.badge.change-withdrawn { background: #fdecea; color: var(--danger); }
+
+.sample-form {
+  display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+  margin: 12px 0 8px;
+}
+.sample-form label { display: flex; flex-direction: column; gap: 5px; min-width: 220px; flex: 1 1 220px; }
+.sample-form select, .sample-form input[type=number] {
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; font-size: 14px;
+}
+.sample-form button { padding: 9px 20px; }
+.sample-result { margin-top: 26px; }
+.samples-table th, .samples-table td { font-size: 13px; }
+.unsampleable { background: #fdf3e3; border-color: #ecd2a4; color: #7a5410; }
+.back-link { font-size: 13px; white-space: nowrap; }
 
 .runlist { margin: 0; padding-left: 18px; font-size: 13px; }
 .runlist li { margin-bottom: 7px; line-height: 1.5; }

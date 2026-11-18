@@ -12,7 +12,7 @@
     <h1>轮次记录</h1>
     <p class="sub">只有成功轮次会同时提交目录与水位；失败与取消不改动已发布内容。</p>
   </div>
-  <nav><a href="/">目录</a><a href="/runs">轮次记录</a><a href="/status">状态 JSON</a></nav>
+  <nav><a href="/">目录</a><a href="/runs">轮次记录</a><a href="/samples">变更抽样</a><a href="/status">状态 JSON</a></nav>
 </header>
 <main class="panel">
   <div class="meta-grid">
@@ -30,7 +30,14 @@
     <tbody>
     {% for run in runs %}
       <tr>
-        <td class="mono">{{ run.id[:8] }}</td>
+        <td class="mono">
+          {{ run.id[:8] }}
+          {% if run.status == 'succeeded' and run.changes_tracked %}
+            <a class="small" href="/samples?run_id={{ run.id }}&sample_size=5&seed=0">抽样</a>
+          {% elif run.status == 'succeeded' %}
+            <span class="small muted" title="旧轮次缺少变更前值，不可抽样">不可抽样</span>
+          {% endif %}
+        </td>
         <td><span class="badge {{ run.status }}">{{ run.status }}</span></td>
         <td class="mono small">{{ run.window_from or "（全量）" }} .. {{ run.window_until or "—" }}</td>
         <td>{{ run.attempt }}</td>

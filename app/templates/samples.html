@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>变更抽样</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>变更抽样核查</h1>
+    <p class="sub">对成功采集轮次实际发布的新增 / 更正 / 撤回抽样，逐条核对变更前后的标题与作者。</p>
+  </div>
+  <nav>
+    <a href="/">目录与采集</a>
+    <a href="/runs">轮次记录</a>
+    <a href="/samples">变更抽样</a>
+    <a href="/status">状态 JSON</a>
+  </nav>
+</header>
+
+<main class="panel">
+  <div class="panel-head">
+    <h2>抽样参数</h2>
+    <a class="back-link" href="/">← 返回采集控制台（开始 / 取消采集轮次）</a>
+  </div>
+
+  {% if error %}<div class="flash">{{ error }}</div>{% endif %}
+
+  <form class="sample-form" method="get" action="/samples">
+    <label>
+      <span class="label">采集轮次（仅成功轮次可抽样）</span>
+      <select name="run_id" required>
+        {% for run in runs %}
+        <option value="{{ run.id }}" {% if run.id == selected_id %}selected{% endif %}>
+          {{ run.started_at }} · {{ run.id[:8] }} · 窗 {{ run.window_from or "（全量）" }} → {{ run.window_until }}
+          {% if not run.changes_tracked %}· 旧轮次（缺前值，不可抽样）{% endif %}
+        </option>
+        {% else %}
+        <option value="" disabled selected>还没有成功采集轮次</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span class="label">样本数（1～20）</span>
+      <input type="number" name="sample_size" min="1" max="20" step="1"
+             value="{{ sample_size }}" required>
+    </label>
+    <label>
+      <span class="label">整数种子</span>
+      <input type="number" name="seed" step="1" value="{{ seed }}" required>
+    </label>
+    <button type="submit" class="primary" {% if not runs %}disabled{% endif %}>抽取样本</button>
+  </form>
+
+  {% if result %}
+  <section class="sample-result">
+    <h2>抽样结果</h2>
+    <div class="meta-grid">
+      <div><span class="label">轮次</span><strong class="mono">{{ result.run.id[:8] }}</strong></div>
+      <div><span class="label">时间窗（闭区间）</span>
+        <strong class="mono small">{{ result.run.window_from or "（全量）" }} .. {{ result.run.window_until }}</strong>
+      </div>
+      <div><span class="label">发布水位</span><strong class="mono small">{{ result.run.watermark_after or "—" }}</strong></div>
+      <div><span class="label">本轮变化总数</span><strong>{{ result.total_changes }}</strong></div>
+      <div><span class="label">新增 / 更正 / 撤回</span>
+        <strong>{{ result.change_counts.added }} / {{ result.change_counts.corrected }} / {{ result.change_counts.withdrawn }}</strong>
+      </div>
+      <div><span class="label">参数</span><strong>样本数 {{ result.params.sample_size }} · 种子 {{ result.params.seed }}</strong></div>
+    </div>
+
+    {% if not result.sampleable %}
+      <div class="flash unsampleable">
+        该轮次是变更追踪上线前的旧成功轮次：发布时没有保存变更前值，
+        <strong>不可抽样</strong>（不代表本轮为零变更）。请选择带变更记录的新轮次。
+      </div>
+    {% elif result.samples %}
+      <p class="small muted">
+        规则：各类有记录且名额够时先各取一条；名额不足按 撤回 → 更正 → 新增 取；
+        其余名额按种子对全部未取记录稳定抽取，不重复。同参数重取或服务重启结果不变。
+      </p>
+      <table class="records samples-table">
+        <thead>
+          <tr>
+            <th>#</th><th>类型</th><th>标识</th>
+            <th>变更前标题</th><th>变更前作者</th>
+            <th>变更后标题</th><th>变更后作者</th>
+            <th>源端时间</th><th>入选方式</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for item in result.samples %}
+          <tr>
+            <td>{{ item.order }}</td>
+            <td><span class="badge change-{{ item.change_type }}">{{ change_labels[item.change_type] }}</span></td>
+            <td class="mono small">{{ item.identifier }}</td>
+            <td>{{ item.before_title if item.before_title is not none else "（不存在）" }}</td>
+            <td>{{ item.before_creator if item.before_creator is not none else "—" }}</td>
+            <td>{{ item.after_title if item.after_title is not none else "（已撤回删除）" }}</td>
+            <td>{{ item.after_creator if item.after_creator is not none else "—" }}</td>
+            <td class="mono small">{{ item.datestamp }}</td>
+            <td class="small">{% if item.pick == "guaranteed" %}保底（各类一条）{% else %}种子抽取{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="small muted">
+        实际抽取 {{ result.samples|length }} 条（变化记录不足时取全部，不重复、不补造）。
+      </p>
+    {% else %}
+      <div class="flash">
+        该轮次发布时没有任何变化：窗口内仅有闭区间重读的未变书目
+        （以及可能存在的、对不存在书目的撤回），这些都不计为变化，因此样本为 0 条。
+      </div>
+    {% endif %}
+  </section>
+  {% elif not error and not runs %}
+  <p class="empty">还没有成功采集轮次。请先到
+    <a href="/">采集控制台</a> 完成一轮成功采集，再回到本页抽样。
+  </p>
+  {% endif %}
+</main>
+</body>
+</html>

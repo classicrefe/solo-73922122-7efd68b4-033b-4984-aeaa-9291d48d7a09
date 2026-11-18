@@ -102,11 +102,43 @@ class Store:
 
                 CREATE INDEX IF NOT EXISTS idx_catalog_title ON catalog(title);
 
+                /* Per-round change evidence, written only by a successful
+                   publish inside the same transaction as the catalogue and
+                   watermark.  Rows are insert-only: later rounds never touch
+                   an older round's before/after values. */
+                CREATE TABLE IF NOT EXISTS run_changes (
+                    run_id TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    change_type TEXT NOT NULL CHECK (
+                        change_type IN ('added', 'corrected', 'withdrawn')
+                    ),
+                    before_title TEXT,
+                    before_creator TEXT,
+                    after_title TEXT,
+                    after_creator TEXT,
+                    datestamp TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    PRIMARY KEY (run_id, identifier),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
                 INSERT OR IGNORE INTO published_state
                     (id, watermark, updated_at, success_count, last_run_id)
                 VALUES (1, NULL, NULL, 0, NULL);
                 """
             )
+            # Legacy databases predate change tracking: successful rounds in
+            # them keep changes_tracked = 0 and are reported as unsampleable
+            # (their before-values were never captured).
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(runs)")
+            }
+            if "changes_tracked" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN changes_tracked "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
 
     def _recover_interrupted_runs(self) -> None:
         """A previous process died.  No in-memory task can own these runs."""
@@ -474,17 +506,56 @@ class Store:
                     (run_id,),
                 ).fetchall()
 
+                # Snapshot the published catalogue *before* this round's
+                # writes so every change keeps its real before-values.  Rows
+                # inserted below are the only evidence of what this round
+                # changed; later rounds insert their own rows and never edit
+                # these.
+                before_rows = self._conn.execute(
+                    "SELECT identifier, title, creator FROM catalog"
+                ).fetchall()
+                before: dict[str, sqlite3.Row] = {
+                    row["identifier"]: row for row in before_rows
+                }
+
                 now = utc_now_millis()
                 upserts = 0
                 deletions = 0
+                change_seq = 0
                 for row in rows:
+                    existing = before.get(row["identifier"])
                     if row["deleted"]:
                         self._conn.execute(
                             "DELETE FROM catalog WHERE identifier = ?",
                             (row["identifier"],),
                         )
                         deletions += 1
+                        if existing is not None:
+                            # A withdrawal of an identifier the catalogue does
+                            # not know is a no-op, not a change.
+                            change_seq += 1
+                            self._conn.execute(
+                                """
+                                INSERT INTO run_changes
+                                    (run_id, identifier, change_type,
+                                     before_title, before_creator,
+                                     after_title, after_creator,
+                                     datestamp, seq)
+                                VALUES (?, ?, 'withdrawn', ?, ?, NULL, NULL,
+                                        ?, ?)
+                                """,
+                                (
+                                    run_id,
+                                    row["identifier"],
+                                    existing["title"],
+                                    existing["creator"],
+                                    row["datestamp"],
+                                    change_seq,
+                                ),
+                            )
                     else:
+                        new_title = row["title"] or ""
+                        new_creator = row["creator"]
                         self._conn.execute(
                             """
                             INSERT INTO catalog
@@ -499,13 +570,53 @@ class Store:
                             """,
                             (
                                 row["identifier"],
-                                row["title"] or "",
-                                row["creator"],
+                                new_title,
+                                new_creator,
                                 row["datestamp"],
                                 now,
                             ),
                         )
                         upserts += 1
+                        if existing is None:
+                            change_type = "added"
+                        elif (
+                            existing["title"] != new_title
+                            or (existing["creator"] or None)
+                            != (new_creator or None)
+                        ):
+                            # A closed-interval re-read of an unchanged
+                            # bibliography writes the same values again and is
+                            # deliberately not recorded as a change.
+                            change_type = "corrected"
+                        else:
+                            change_type = None
+                        if change_type is not None:
+                            change_seq += 1
+                            self._conn.execute(
+                                """
+                                INSERT INTO run_changes
+                                    (run_id, identifier, change_type,
+                                     before_title, before_creator,
+                                     after_title, after_creator,
+                                     datestamp, seq)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    run_id,
+                                    row["identifier"],
+                                    change_type,
+                                    None
+                                    if existing is None
+                                    else existing["title"],
+                                    None
+                                    if existing is None
+                                    else existing["creator"],
+                                    new_title,
+                                    new_creator,
+                                    row["datestamp"],
+                                    change_seq,
+                                ),
+                            )
 
                 watermark = run["window_until"]
                 self._conn.execute(
@@ -526,6 +637,7 @@ class Store:
                            finished_at = ?,
                            phase = 'published',
                            watermark_after = ?,
+                           changes_tracked = 1,
                            last_error = NULL
                      WHERE id = ?
                     """,
@@ -649,6 +761,46 @@ class Store:
                 "pages": pages,
                 "query": query,
             }
+
+    def list_successful_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Rounds that published, newest first (only these can be sampled)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM runs WHERE status = 'succeeded'
+                 ORDER BY started_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def run_changes(self, run_id: str) -> list[dict[str, Any]] | None:
+        """Return a successful round's change evidence in deterministic order.
+
+        ``None`` means the run does not exist or did not publish; an empty list
+        means the round genuinely published zero changes (empty window or only
+        unchanged closed-interval re-reads).  Legacy successful rounds created
+        before change tracking existed are distinguishable through
+        ``runs.changes_tracked`` and are reported unsampleable by callers.
+        """
+        with self._lock:
+            run = self._conn.execute(
+                "SELECT id, status, changes_tracked FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None or run["status"] != "succeeded":
+                return None
+            rows = self._conn.execute(
+                """
+                SELECT run_id, identifier, change_type,
+                       before_title, before_creator,
+                       after_title, after_creator, datestamp, seq
+                  FROM run_changes WHERE run_id = ?
+                 ORDER BY seq, identifier
+                """,
+                (run_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def close(self) -> None:
         with self._lock:
